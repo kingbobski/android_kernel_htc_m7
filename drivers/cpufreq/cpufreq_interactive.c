@@ -56,6 +56,7 @@ struct cpufreq_interactive_cpuinfo {
 	struct rw_semaphore enable_sem;
 	int governor_enabled;
 	int prev_load;
+	bool minfreq_boosted;
 	bool limits_changed;
 };
 
@@ -203,13 +204,23 @@ static void cpufreq_interactive_timer_resched(
  * The cpu_timer and cpu_slack_timer must be deactivated when calling this
  * function.
  */
-static void cpufreq_interactive_timer_start(int cpu)
+static void cpufreq_interactive_timer_start(int cpu, int time_override)
 {
 	struct cpufreq_interactive_cpuinfo *pcpu = &per_cpu(cpuinfo, cpu);
 	unsigned long expires = jiffies + usecs_to_jiffies(timer_rate);
 	unsigned long flags;
 	u64 now = ktime_to_us(ktime_get());
 
+	unsinged long expires;
+	if(time_override)
+	{
+		expires = jiffies + time_override;
+	}
+	else
+	{
+		expires = jiffies + usecs_to_jiffies(timer_rate);
+	}
+	
 	pcpu->cpu_timer.expires = expires;
 	add_timer_on(&pcpu->cpu_timer, cpu);
 	if (timer_slack_val >= 0 &&
@@ -477,6 +488,12 @@ static void cpufreq_interactive_timer(unsigned long data)
 
 	new_freq = pcpu->freq_table[index].frequency;
 
+	if(pcpu->minfreq_boosted)
+	{
+		mod_min_sample_time = 0;
+		pcpu->minfreq_boosted = false;
+	}
+	
 	/*
 	 * Do not scale below floor_freq unless we have been at or above the
 	 * floor frequency for the minimum sample time since last validated.
@@ -1274,7 +1291,7 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			down_write(&pcpu->enable_sem);
 			del_timer_sync(&pcpu->cpu_timer);
 			del_timer_sync(&pcpu->cpu_slack_timer);
-			cpufreq_interactive_timer_start(j);
+			cpufreq_interactive_timer_start(j,0);
 			pcpu->governor_enabled = 1;
 			up_write(&pcpu->enable_sem);
 		}
@@ -1346,10 +1363,31 @@ static int cpufreq_governor_interactive(struct cpufreq_policy *policy,
 			spin_lock_irqsave(&pcpu->target_freq_lock, flags);
 			if (policy->max < pcpu->target_freq) {
 				pcpu->target_freq = policy->max;
-			} else if (policy->min >= pcpu->target_freq) {
+			} if (policy->min >= pcpu->target_freq) {
 				pcpu->target_freq = policy->min;
-				anyboost = 1;
+				
+				// Timer
+				del_timer_sync(&pcpu->cpu_timer);
+				del_timer_sync(&pcpu->cpu_slack_timer);
+				cpufreq_interactive_timer_start(j,0);
 			}
+			else
+			{
+				del_timer_sync(&pcpu->cpu_timer);
+				del_timer_sync(&pcpu->cpu_slack_timer);
+				if(pcpu->cpu_timer.expires - jiffies >0)
+				{
+					cpufreq_interactive_timer_start(j,0);
+					
+				}
+				else
+				{
+					cpufreq_interactive_timer_start(j,1);
+				}
+				pcpu->minfreq_boosted = true;
+				up_write(&pcpu->enable_sem);
+			}	
+			
 
 			spin_unlock_irqrestore(&pcpu->target_freq_lock, flags);
 			up_read(&pcpu->enable_sem);
